@@ -83,6 +83,55 @@ with tab1:
     #Affichage tableau
     st.dataframe(type_de_vote)
 
+with tab2:
+    st.subheader("Analyse des scrutins")
+    query_type_vote_nb_taux = """
+        SELECT 
+            libelleTypeVote,
+            COUNT(*) AS NB_total,
+            SUM(CASE WHEN codesort = 'adopté' THEN 1 ELSE 0 END) AS NB_adopte,
+            ROUND(
+                100 * SUM(CASE WHEN codesort = 'adopté' THEN 1 ELSE 0 END) / COUNT(*),
+                2
+            ) AS TA
+        FROM vote
+        GROUP BY libelleTypeVote
+        ORDER BY NB_total DESC;
+    """
+    type_vote_nb_taux = pd.read_sql(query_type_vote_nb_taux, conn)
+    # --- S'assurer que TA est bien numérique ---
+    type_vote_nb_taux["TA"] = pd.to_numeric(type_vote_nb_taux["TA"], errors="coerce")
+    # --- Graphique Plotly ---
+    fig = px.bar(
+        type_vote_nb_taux,
+        x="libelleTypeVote",
+        y="TA",
+        text="TA",
+        color="TA",
+        color_continuous_scale="Viridis",
+        title="Taux d’adoption par type de vote (%)"
+    )
+
+    # --- Mise en forme ---
+    fig.update_traces(texttemplate='%{text:.2f}%', textposition='outside')
+    fig.update_layout(
+        xaxis_title="Type de vote",
+        yaxis_title="Taux d’adoption (%)",
+        coloraxis_showscale=False,
+        uniformtext_minsize=8,
+        uniformtext_mode='hide',
+    )
+    fig.update_yaxes(range=[0, 100])
+
+    # --- Affichage Streamlit ---
+    st.plotly_chart(fig, use_container_width=True)
+
+    #Affichage en tableau
+    col3, col4 = st.columns(2)
+    col3.metric("Nombre de députés", nb_deputes)
+    col4.metric("Nombre de scrutins", nb_scrutins)
+
+
 with tab3:
     # Liste des législatures disponibles
     df_legislatures = pd.read_sql(
@@ -151,3 +200,109 @@ with tab3:
     if depute_selectionne:
         depute_uid = df_deputes.loc[df_deputes["nom_complet"] == depute_selectionne, "uid"].iloc[0]
         st.write(f"Député sélectionné : {depute_selectionne}")
+
+
+
+        # --- Récupération des informations générales ---
+        query_infos = f"""
+            SELECT civilite, prenom, nom, dateNaissance, villeNaissance, dateDeces
+            FROM depute
+            WHERE uid = '{depute_uid}'
+        """
+        df_infos = pd.read_sql(query_infos, conn)
+
+        # --- Présentation ---
+        if not df_infos.empty:
+            infos = df_infos.iloc[0]
+
+            st.subheader("Informations générales")
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown(f"**Nom :** {infos['civilite']} {infos['prenom']} {infos['nom']}")
+                st.markdown(f"**Date de naissance :** {infos['dateNaissance']}")
+                st.markdown(f"**Ville de naissance :** {infos['villeNaissance']}")
+
+            with col2:
+                if pd.notna(infos["dateDeces"]):
+                    st.markdown(f"**Décédé le :** {infos['dateDeces']}")
+                else:
+                    st.markdown("**Statut :** Vivant")
+
+    # Récupération des votes pour le député
+    query_votes = f"""
+        SELECT votedepute.decision AS decision_depute, vote.codesort AS decision_assemblee
+        FROM votedepute
+        INNER JOIN vote ON votedepute.vote = vote.uid
+        WHERE votedepute.depute = '{depute_uid}'
+        AND vote.legislature = {legislature}
+    """
+    df_votes = pd.read_sql(query_votes, conn)
+
+    # Nombre total de scrutins pour la législature
+    query_total_scrutins = f"""
+        SELECT COUNT(*) AS total_scrutins
+        FROM vote
+        WHERE legislature = {legislature}
+    """
+    total_scrutins = pd.read_sql(query_total_scrutins, conn)["total_scrutins"].iloc[0]
+
+    # KPI 1 : Nombre de votes exprimés
+    nb_votes = df_votes.shape[0]
+
+    # KPI 2 : Taux de participation (en %)
+    # Ici on considère qu'un vote est "exprimé" si la colonne decision_depute n'est pas NaN
+    votes_exprimes = df_votes["decision_depute"].notna().sum()
+    taux_participation = (nb_votes / total_scrutins * 100) if total_scrutins > 0 else 0
+
+    # KPI 3 : Taux d'accord avec l'Assemblée
+    accord = df_votes[
+        ((df_votes["decision_depute"] == "pour") & (df_votes["decision_assemblee"] == "adopté")) |
+        ((df_votes["decision_depute"] == "contre") & (df_votes["decision_assemblee"] == "rejeté"))
+    ]
+    taux_accord = (len(accord) / nb_votes * 100) if nb_votes > 0 else 0
+
+    # Affichage dans Streamlit
+    st.subheader("📊 KPI du député")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Nombre de votes exprimés", nb_votes)
+    col2.metric("Taux de participation", f"{taux_participation:.1f}%")
+    col3.metric("Taux d'accord avec l'Assemblée", f"{taux_accord:.1f}%")
+
+    # Requête des votes du député sélectionné
+    query_votes = f"""
+        SELECT decision
+        FROM votedepute
+        INNER JOIN vote ON votedepute.vote = vote.uid
+        WHERE votedepute.depute = '{depute_uid}'
+        AND vote.legislature = {legislature}
+    """
+    df_votes = pd.read_sql(query_votes, conn)
+
+    # Nettoyage et regroupement
+    df_votes = df_votes.dropna(subset=["decision"])
+    df_decision = df_votes["decision"].value_counts().reset_index()
+    df_decision.columns = ["Décision", "Nombre"]
+
+    # Création du camembert
+    fig = px.pie(
+        df_decision,
+        values="Nombre",
+        names="Décision",
+        title="Répartition des votes du député",
+        hole=0.3,  # pour un effet donut
+        color="Décision",
+            color_discrete_map={
+        "pour": "#2ECC71",        # vert
+        "contre": "#E74C3C",      # rouge
+        "abstention": "#F1C40F",  # jaune
+        "nonVotant": "#95A5A6",   # gris
+        "nonVoté": "#BDC3C7",     # gris clair (si tu as cette catégorie)
+        "absent": "#7F8C8D"       # optionnel
+    }
+    )
+
+    fig.update_traces(textinfo="percent+label")
+
+    # Affichage Streamlit
+    st.plotly_chart(fig, use_container_width=True)
